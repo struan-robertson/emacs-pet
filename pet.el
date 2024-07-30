@@ -115,13 +115,30 @@ and nil otherwise."
 
 
 
+(defun pet--executable-find-tramp (command &optional remote)
+  "Re-implementation of `executable-find' using `tramp-remote-path'."
+  (let ((res (locate-file
+	      command
+	      (mapcar (lambda (x)
+			(when (stringp x)
+			  (if (file-remote-p x)
+			      x
+			    (concat (file-remote-p default-directory) x))))
+		      tramp-remote-path)
+	      exec-suffixes 'file-executable-p)))
+    (when (stringp res) (file-local-name res))))
+
 (defun pet--executable-find (command &optional remote)
   "Like Emacs 27's `executable-find', ignore REMOTE on Emacs 26.
 
 See `executable-find' for the meaning of COMMAND and REMOTE."
+    
   (if (>= emacs-major-version 27)
-      (executable-find command remote)
+      (if (and remote (file-remote-p default-directory))
+	  (pet--executable-find-tramp command remote)
+	(executable-find command remote))
     (executable-find command)))
+
 
 (defun pet-system-bin-dir ()
   "Determine the correct script directory based on `system-type'."
@@ -781,62 +798,70 @@ default otherwise."
 FN is `eglot--executable-find', ARGS is the arguments to
 `eglot--executable-find'."
   (pcase-let ((`(,command . ,_) args))
-    (if (member command '("pylsp" "pyls" "pyright-langserver" "jedi-language-server" "ruff-lsp"))
-        (pet-executable-find command)
-      (apply fn args))))
+    (pet-executable-find command)))
 
+(defun pet--get-local-path (path)
+  "If `path' is a tramp path, return the local path on the remote machine, otherwise just return `path'."
+  (cond
+   ((null path)
+    nil)
+   ((file-remote-p path)
+    (tramp-file-name-localname (tramp-dissect-file-name path)))
+   (t path)))
+  
 (defun pet-lookup-eglot-server-initialization-options (command)
-  "Return LSP initializationOptions for Eglot.
+    "Return LSP initializationOptions for Eglot.
 
 COMMAND is the name of the Python language server command."
-  (cond ((string-match-p "pylsp" command)
-         `(:pylsp
-           (:plugins
-            (:jedi
-             (:environment
-              ,(pet-virtualenv-root))
-             :ruff
+    (cond ((string-match-p "pylsp" command)
+           `(:pylsp
+             (:plugins
+              (:jedi
+               (:environment
+		,(pet--get-local-path (pet-virtualenv-root)))
+               :ruff
+               (:executable
+		,(pet-executable-find "ruff"))
+               :pylsp_mypy
+               (:overrides
+		["--python-executable" ,(pet-executable-find "python") t])
+               :flake8
+               (:executable
+		,(pet-executable-find "flake8"))
+               :pylint
+               (:executable
+		,(pet-executable-find "pylint"))))))
+          ((string-match-p "pyls" command)
+           `(:pyls
+             (:plugins
+              (:jedi
+               (:environment
+		,(pet--get-local-path (pet-virtualenv-root)))
+               :pylint
+               (:executable
+		,(pet-executable-find "pylint"))))))
+          ((string-match-p "pyright-langserver" command)
+           `(:python
+             (:pythonPath
+              ,(pet-executable-find "python")
+              :venvPath
+              ,(pet-virtualenv-root))))
+          ((string-match-p "jedi-language-server" command)
+           `(:jedi
              (:executable
-              ,(pet-executable-find "ruff"))
-             :pylsp_mypy
-             (:overrides
-              ["--python-executable" ,(pet-executable-find "python") t])
-             :flake8
-             (:executable
-              ,(pet-executable-find "flake8"))
-             :pylint
-             (:executable
-              ,(pet-executable-find "pylint"))))))
-        ((string-match-p "pyls" command)
-         `(:pyls
-           (:plugins
-            (:jedi
-             (:environment
-              ,(pet-virtualenv-root))
-             :pylint
-             (:executable
-              ,(pet-executable-find "pylint"))))))
-        ((string-match-p "pyright-langserver" command)
-         `(:python
-           (:pythonPath
-            ,(pet-executable-find "python")
-            :venvPath
-            ,(pet-virtualenv-root))))
-        ((string-match-p "jedi-language-server" command)
-         `(:jedi
-           (:executable
-            (:command
-             ,(pet-executable-find "jedi-language-server"))
-            :workspace
-            (:environmentPath
-             ,(pet-executable-find "python")))))
-        ((string-match-p "ruff-lsp" command)
-         `(:settings
-           (:interpreter
-            ,(pet-executable-find "python")
-            :path
-            ,(pet-executable-find "ruff"))))
-        (t nil)))
+              (:command
+               ,(pet-executable-find "jedi-language-server"))
+              :workspace
+              (:environmentPath
+               ,(pet-executable-find "python")))))
+          ((string-match-p "ruff-lsp" command)
+           `(:settings
+             (:interpreter
+              ,(pet-executable-find "python")
+              :path
+              ,(pet-executable-find "ruff"))))
+          (t (progn
+	       (error "No LSP servers found")))))
 
 (defalias 'pet--proper-list-p 'proper-list-p)
 (eval-when-compile
@@ -868,58 +893,49 @@ COMMAND is the name of the Python language server command."
                   (copy-tree a t)
                   (copy-tree b t)))
 
-(defun pet-eglot--workspace-configuration-plist-advice (fn &rest args)
-  "Enrich `eglot-workspace-configuration' with paths found by `pet'.
-
-FN is `eglot--workspace-configuration-plist', ARGS is the
-arguments to `eglot--workspace-configuration-plist'."
-  (let* ((path (cadr args))
-         (canonical-path (if (and path (file-directory-p path))
-                             (file-name-as-directory path)
-                           path))
-         (server (car args))
-         (command (process-command (jsonrpc--process server)))
-         (program (and (listp command) (car command)))
-         (pet-config (pet-lookup-eglot-server-initialization-options program))
-         (user-config (apply fn server (and canonical-path (cons canonical-path (cddr args))))))
-    (pet-merge-eglot-initialization-options user-config pet-config)))
-
-(defun pet-eglot--guess-contact-advice (fn &rest args)
-  "Enrich `eglot--guess-contact' with paths found by `pet'.
-
-FN is `eglot--guess-contact', ARGS is the arguments to
-`eglot--guess-contact'."
-  (let* ((result (apply fn args))
-         (contact (nth 3 result))
-         (probe (seq-position contact :initializationOptions))
-         (program-with-args (seq-subseq contact 0 (or probe (length contact))))
-         (program (car program-with-args))
-         (init-opts (plist-get (seq-subseq contact (or probe 0)) :initializationOptions)))
-    (if init-opts
-        (append (seq-subseq result 0 3)
-                (list
-                 (append
-                  program-with-args
-                  (list
-                   :initializationOptions
-                   (pet-merge-eglot-initialization-options
-                    init-opts
-                    (pet-lookup-eglot-server-initialization-options
-                     program)))))
-                (seq-subseq result 4))
-      result)))
+(defun pet--detect-eglot-lsp-command ()
+  "First tries to determine lsp command from `eglot-workspace-configuration' and then if unsuccessful uses `pet-executable-find' to try and find installed lsp servers."
+  (let ((workspace-config (car eglot-workspace-configuration)))
+    (cond
+     ((plist-member workspace-config :pylsp)
+      "pylsp")
+     ((plist-member workspace-config :pyls)
+      "pyls")
+     ((plist-member workspace-config :pyright-langserver)
+      "pyright-langserver")
+     ((plist-member workspace-config :jedi-language-server)
+      "jedi-language-server")
+     ((plist-member workspace-config :ruff-lsp)
+      "ruff-lsp")
+     ((pet-executable-find "pylsp")
+      "pylsp")
+     ((pet-executable-find "pyls")
+      "pyls")
+     ((pet-executable-find "pyright-langserver")
+      "pyright-langserver")
+     ((pet-executable-find "jedi-language-server")
+      "jedi-language-server")
+     ((pet-executable-find "ruff-lsp")
+      "ruff-lsp")
+     (t nil))))
 
 (defun pet-eglot-setup ()
   "Set up Eglot to use server executables and virtualenvs found by PET."
   (advice-add 'eglot--executable-find :around #'pet-eglot--executable-find-advice)
-  (advice-add 'eglot--workspace-configuration-plist :around #'pet-eglot--workspace-configuration-plist-advice)
-  (advice-add 'eglot--guess-contact :around #'pet-eglot--guess-contact-advice))
+
+  (setq-local enable-remote-dir-locals t)
+
+  (when-let ((root (pet-project-root)))
+    (dir-locals-set-class-variables
+	 'pet-directory
+	 `((python-base-mode
+	    . ((eglot-workspace-configuration
+		. ,(pet-merge-eglot-initialization-options eglot-workspace-configuration (pet-lookup-eglot-server-initialization-options (pet--detect-eglot-lsp-command))))))))
+    (dir-locals-set-directory-class root 'pet-directory)))
 
 (defun pet-eglot-teardown ()
   "Tear down PET advices to Eglot."
-  (advice-remove 'eglot--executable-find #'pet-eglot--executable-find-advice)
-  (advice-remove 'eglot--workspace-configuration-plist #'pet-eglot--workspace-configuration-plist-advice)
-  (advice-remove 'eglot--guess-contact #'pet-eglot--guess-contact-advice))
+  (advice-remove 'eglot--executable-find #'pet-eglot--executable-find-advice))
 
 
 (defvar dape-command)
